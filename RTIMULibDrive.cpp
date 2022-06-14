@@ -1,17 +1,24 @@
+#define DEV_INPUT_EVENT "/dev/input"
+#define EVENT_DEV_NAME "event"
+
 #include "RTIMULib.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
 #include <stdlib.h>
-
+#include <linux/input.h>
+#include <linux/fb.h>
+#include <string.h>
+#include <dirent.h>
+#include <poll.h>
 
 #define ACK "ackfromunity"
 
 struct packetData{
-	RTFLOAT angle[3];
-	RTFLOAT angleVel[3];
-	RTFLOAT vel[3];
+	RTFLOAT angle[4];
+	RTFLOAT devSpeed;
+	int btnClick;
 };
 
 struct host_info{
@@ -19,14 +26,19 @@ struct host_info{
 	struct sockaddr_in recver;
 };
 
+
+//----------------------------------- global
 int PORTNO;
-float friction;
-float accelFilter;
+RTQuaternion qStart;
+int btnDir;
+
+//----------------------------------- global
 
 struct host_info initSocket();
 int sndPkt(struct host_info *host, struct packetData* data);
-void calcVel(RTVector3 *vel, RTVector3 *linearAccel, int sampleRate);
-
+void updateVRData(struct packetData *data, RTIMU_DATA *sensor, struct pollfd *joyfd, int sampleRate);
+struct pollfd initJoystick();
+int getJoystickDir(struct pollfd* evpoll);
 
 int main(int argc, char* argv[])
 {
@@ -38,22 +50,8 @@ int main(int argc, char* argv[])
         PORTNO = 9002;
     }
     
-    if(argc >= 3){
-	friction = atof(argv[2]);
-    }
-    else{
-	friction = 10;
-    }
-    if(argc >= 4){
-	accelFilter = atof(argv[3]);
-    }
-    else{
-	accelFilter = 0.3;
-    }
 
-
-        printf("%d\n",PORTNO);
-	printf("%f\n",friction);
+    printf("%d\n",PORTNO);
 
     int sampleCount = 0;
     int sampleRate = 0;
@@ -61,16 +59,19 @@ int main(int argc, char* argv[])
     uint64_t displayTimer;
     uint64_t now;
 
-    //---------------------------------------------- send
+    //---------------------------------------------- data struct init
 
     struct packetData data;
     struct host_info host = initSocket();
 
+    struct pollfd joyfd = initJoystick();
     
     memset((char*)&data, '\0', sizeof(data));
+    
+    //---------------------------------------------- 
 
 
-    //---------------------------------------------- send
+
 
 
     RTIMUSettings *settings = new RTIMUSettings("RTIMULib");
@@ -91,60 +92,44 @@ int main(int argc, char* argv[])
 
     rateTimer = displayTimer = RTMath::currentUSecsSinceEpoch();
 
-    RTVector3 deg;
-    RTVector3 gravityAccel;
-    RTVector3 linearAccel;
 
-    RTVector3 velocity;
-    velocity.zero();
+    //---------------------------------------- imu setting init
+    imu->IMURead();
+    
+    qStart = imu->getIMUData().fusionQPose;
+
+
+    qStart.setX(0);
+    qStart.setY(0);
+    qStart.normalize();
+    qStart = qStart.conjugate();
+
+    //-------------------------------------------------------
+
 
     while (1) {
-	//printf("%d\n", settings->m_fusionType);	
 
         usleep(imu->IMUGetPollInterval() * 1000);
 
         while (imu->IMURead())
-	{
+	      {
             RTIMU_DATA imuData = imu->getIMUData();
             sampleCount++;
 
             now = RTMath::currentUSecsSinceEpoch();
 
 
-	    //------------------------------ linear Accel
-	    deg = imuData.fusionPose;
-	    gravityAccel.setX(-sin(deg.y()));
-	    gravityAccel.setY(sin(deg.x())*cos(deg.y()));
-	    gravityAccel.setZ(cos(deg.x())*cos(deg.y()));
-
-	    linearAccel = imuData.accel;
-	    linearAccel-=gravityAccel;
-	    //----------------------------- 
-
             if ((now - displayTimer) > 100000) {
-                //printf("1: Sample rate %d: %s\n", sampleRate, RTMath::displayDegrees("", imuData.fusionPose));	
-		//printf("1: Sample rate %d: %s\n", sampleRate, RTMath::displayRadians("", linearAccel));	
-		//printf("2: Sample rate %d: %s\n", sampleRate, RTMath::displayRadians("", imuData.compass));
-		
-
-		calcVel(&velocity, &linearAccel, sampleRate);
-		    
-		
-		//printf("2: Sample rate %d: %s\n", sampleRate, RTMath::displayRadians("", velocity));	
-
-		fflush(stdout);
+                //printf("1: Sample rate %d: %s\n", sampleRate, RTMath::displayDegrees("", imuData.fusionPose));
+                
+                //--------------------------------------------------------------- custom
+                
+                	
+                updateVRData(&data , &imuData, &joyfd, sampleRate);
+            		sndPkt(&host, &data);
 
 
-		data.angle[0] = imuData.fusionPose.x() * RTMATH_RAD_TO_DEGREE;
-		data.angle[1] = imuData.fusionPose.y() * RTMATH_RAD_TO_DEGREE;
-		data.angle[2] = imuData.fusionPose.z() * RTMATH_RAD_TO_DEGREE;
-		
-		
-		
-
-
-		sndPkt(&host, &data);
-
+                //--------------------------------------------------------------- custom
 
                 displayTimer = now;
 		}
@@ -162,23 +147,6 @@ int main(int argc, char* argv[])
 }
 
 
-void displayPasswd(){
-	
-}
-
-
-int generatePasswd(){
-	int ret = 0, i;
-	srand(time(NULL));
-	
-	for(i=0;i<8;i++){
-		ret*=10;
-		ret+=(rand()%9);
-	}
-
-	return ret;
-
-}
 
 struct host_info initSocket(){
 	struct timeval pollInterval = {1, 0};
@@ -262,7 +230,7 @@ struct host_info initSocket(){
 int sndPkt(struct host_info *host, struct packetData* data){
 
 		
-	if((sendto(host->sd, data, sizeof(*data), 0,
+	if((sendto(host->sd, (char*)data, sizeof(*data), 0,
 	(struct sockaddr*)&(host->recver), sizeof(host->recver))) == -1){
 		perror("sendto");
 		return -1;
@@ -272,44 +240,156 @@ int sndPkt(struct host_info *host, struct packetData* data){
 
 }
 
-void calcVel(RTVector3 *vel, RTVector3 *linearAccel, int sampleRate){
+void updateVRData(struct packetData *data, RTIMU_DATA *sensor, struct pollfd *joyfd, int sampleRate){
 
+  //-------------------------- settings
 	sampleRate = sampleRate == 0 ? 44:sampleRate;
 		
 	float eTime = 1.0/sampleRate;
+ 
+  RTQuaternion deg = sensor->fusionQPose;
+  
+  //------------------------------ calc linear Accel and update devSpeed
+  
+  RTVector3 gravityAccel;
+  RTVector3 linearAccel;
+  
+  gravityAccel.setX(-sin(deg.y()));
+  gravityAccel.setY(sin(deg.x())*cos(deg.y()));
+  gravityAccel.setZ(cos(deg.x())*cos(deg.y()));
 
-	if(linearAccel->length() > accelFilter){
-	linearAccel->setX(linearAccel->x()*eTime);
-	linearAccel->setY(linearAccel->y()*eTime);
-	linearAccel->setZ(linearAccel->z()*eTime);
+  linearAccel = sensor->accel;
+  linearAccel-=gravityAccel;
+  
+  data->devSpeed = linearAccel.length();
+  
+  //----------------------------- update devangle
+  printf("1: %f %f %f %f\n", deg.x(), deg.y(), deg.z(), deg.scalar());
+  printf("2: %f %f %f %f\n", qStart.x(), qStart.y(), qStart.z(), qStart.scalar());
+  deg= qStart * deg;
+  deg.normalize();
+  printf("3: %f %f %f %f\n", deg.x(), deg.y(), deg.z(), deg.scalar());
+  
+  data->angle[0] = deg.x() ;
+  data->angle[1] = deg.y() ;
+  data->angle[2] = deg.z() ;
+  data->angle[3] = deg.scalar();
+		
+  //------------------------------ update 
 
-	(*vel)+=(*linearAccel);
-
-	}
-
-	
-	RTVector3 drag = (*vel);
-
-	RTFLOAT mag = RTVector3::dotProduct((*vel), (*vel));
-
-
-	
-
-	if(mag > 0)
-		drag.normalize();
-
-
-	drag.setX(drag.x() * mag * friction * eTime);
-	drag.setY(drag.y() * mag * friction * eTime);
-	drag.setZ(drag.z() * mag * friction * eTime);
-
-	printf("%f %f %f\n",linearAccel->x(), linearAccel->y(), linearAccel->z());
-
-//	printf("acce: %f %f %f\ndrag: %f %f %f\nvel: %f %f %f\n\n",
-//	linearAccel->x(),linearAccel->y(),linearAccel->z(),
-//	drag.x(), drag.y(), drag.z(),
-//	vel->x(), vel->y(), vel->z());
-
-	(*vel)-= drag;
+  data->btnClick = getJoystickDir(joyfd);
 	
 }
+
+
+
+//----------------------------------------------------------------------------------------------------------------- joystick
+
+static int is_event_device(const struct dirent *dir)
+{
+	return strncmp(EVENT_DEV_NAME, dir->d_name,
+		       strlen(EVENT_DEV_NAME)-1) == 0;
+}
+
+static int open_evdev(const char *dev_name)
+{
+	struct dirent **namelist;
+	int i, ndev;
+	int fd = -1;
+
+	ndev = scandir(DEV_INPUT_EVENT, &namelist, is_event_device, versionsort);
+	if (ndev <= 0)
+		return ndev;
+
+	for (i = 0; i < ndev; i++)
+	{
+		char fname[64];
+		char name[256];
+
+		snprintf(fname, sizeof(fname),
+			 "%s/%s", DEV_INPUT_EVENT, namelist[i]->d_name);
+		fd = open(fname, O_RDONLY); // Open with read only
+		if (fd < 0)
+			continue;
+		ioctl(fd, EVIOCGNAME(sizeof(name)), name);
+
+
+		//printf("%s\n", namelist[i]->d_name);
+
+		if (strcmp(dev_name, name) == 0)
+			break;
+		close(fd);
+	}
+
+	for (i = 0; i < ndev; i++)
+		free(namelist[i]);
+
+	return fd;
+}
+
+struct pollfd initJoystick(){
+  
+    struct pollfd evpoll = {
+		  .events = POLLIN,
+	  };
+  
+    evpoll.fd = open_evdev("Raspberry Pi Sense HAT Joystick"); // save joystick event file descriptor  to evpoll.fd
+	  if (evpoll.fd < 0) {
+		    fprintf(stderr, "Event device not found.\n");
+		    exit(1);
+	}
+ 
+  return evpoll;
+}
+
+
+int getJoystickDir(struct pollfd* evpoll){
+
+
+  struct input_event ev[64]; // this system use input_event
+  int i, rd;
+
+  while (poll(evpoll, 1, 0) > 0){
+  
+	  rd = read(evpoll->fd, ev, sizeof(struct input_event) * 64);
+	  if (rd < (int) sizeof(struct input_event)) { // read input info from joystick
+	  	fprintf(stderr, "expected %d bytes, got %d\n",
+	  	        (int) sizeof(struct input_event), rd);
+	  	return -1;
+	  }
+
+     
+	  for (i = 0; i < rd / sizeof(struct input_event); i++) {
+	  	if (ev->type != EV_KEY)
+	  		continue;
+	  	if (ev->value == 0)
+	  		continue;
+	  	switch (ev->code) {  // read input from joystick
+	  		case KEY_ENTER:
+	  			return 0;
+          break;
+        case KEY_UP:
+          return 1;
+	  			break;
+        case KEY_DOWN:
+          return 2;
+	  			break;
+        case KEY_LEFT:
+          return 3;
+	  			break;
+        case KEY_RIGHT:
+          return 4;
+          break;
+        default:
+          return -1;
+		  		break;
+		  }
+	  }
+  }
+  return -1;
+}
+
+
+
+
+
